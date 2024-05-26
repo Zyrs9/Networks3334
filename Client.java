@@ -40,13 +40,13 @@ public class Client {
                     }
 
                     if (serverIn.ready()) {  // Check if there's input from the server
-                        System.out.println("Server says: " + serverIn.readLine());
+                        System.out.println(STR."Server says: \{serverIn.readLine()}");
                     }
                 }
             }
             udpListenerThread.join(); // Wait for the UDP listener to finish
         } catch (Exception e) {
-            System.out.println("Error: " + e.getMessage());
+            System.out.println(STR."Error: \{e.getMessage()}");
         } finally {
             if (udpSocket != null && !udpSocket.isClosed()) {
                 udpSocket.close();
@@ -61,10 +61,10 @@ public class Client {
             while (keepListening) {
                 udpSocket.receive(packet);
                 String received = new String(packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8);
-                System.out.println("Received UDP packet: " + received);
+                System.out.println(STR."Received UDP packet: \{received}");
             }
         } catch (IOException e) {
-            System.out.println("UDP socket closed or error: " + e.getMessage());
+            System.out.println(STR."UDP socket closed or error: \{e.getMessage()}");
         }
     }
 }
