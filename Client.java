@@ -3,48 +3,48 @@ import java.net.*;
 import java.nio.charset.StandardCharsets;
 
 public class Client {
-    private static final String SERVER_ADDRESS = "localhost";
-    private static final int SERVER_PORT = 11112;
-    private static final int UDP_PORT = 11113;
+    private static final String LOAD_BALANCER_ADDRESS = "localhost";
+    private static final int LOAD_BALANCER_PORT = 11114;
     private static DatagramSocket udpSocket;
     private static volatile boolean keepListening = true;
 
     public static void main(String[] args) {
         try {
-            udpSocket = new DatagramSocket(UDP_PORT);
+            udpSocket = new DatagramSocket();
             Thread udpListenerThread = new Thread(Client::listenForUDP);
             udpListenerThread.start();
 
-            try (Socket socket = new Socket(SERVER_ADDRESS, SERVER_PORT);
-                 PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-                 BufferedReader serverIn = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
+            try (Socket lbSocket = new Socket(LOAD_BALANCER_ADDRESS, LOAD_BALANCER_PORT);
+                 BufferedReader lbIn = new BufferedReader(new InputStreamReader(lbSocket.getInputStream()));
+                 PrintWriter lbOut = new PrintWriter(lbSocket.getOutputStream(), true)) {
 
-                BufferedReader userIn = new BufferedReader(new InputStreamReader(System.in));
-                String userInput;
+                String serverAddress = lbIn.readLine().replace("/", "").trim();
+                System.out.println("Directed to connect to server at: " + serverAddress);
 
-                while (true) {
-                    if (userIn.ready()) {  // Check if there's input from the user
-                        userInput = userIn.readLine();
-                        if ("quit".equalsIgnoreCase(userInput)) {
-                            out.println(userInput);
-                            keepListening = false;  // Stop the UDP listener
-                            break;  // Exit the while loop and close the application
-                        } else {
-                            out.println(userInput);
-                            if ("cancel".equalsIgnoreCase(userInput)) {
-                                keepListening = false;  // Stop the UDP listener
-                            } else {
-                                keepListening = true;  // Ensure the listener is active unless cancel is called
+                String[] addressParts = serverAddress.split(":");
+                try (Socket serverSocket = new Socket(addressParts[0], Integer.parseInt(addressParts[1]));
+                     BufferedReader serverIn = new BufferedReader(new InputStreamReader(serverSocket.getInputStream()));
+                     PrintWriter serverOut = new PrintWriter(serverSocket.getOutputStream(), true);
+                     BufferedReader userIn = new BufferedReader(new InputStreamReader(System.in))) {
+
+                    String userInput;
+                    while (true) {
+                        if (userIn.ready()) {
+                            userInput = userIn.readLine();
+                            serverOut.println(userInput);
+                            if ("quit".equalsIgnoreCase(userInput)) {
+                                keepListening = false;
+                                break;
                             }
                         }
-                    }
 
-                    if (serverIn.ready()) {  // Check if there's input from the server
-                        System.out.println("Server says: " + serverIn.readLine());
+                        if (serverIn.ready()) {
+                            System.out.println("Server says: " + serverIn.readLine());
+                        }
                     }
                 }
             }
-            udpListenerThread.join(); // Wait for the UDP listener to finish
+            udpListenerThread.join();
         } catch (Exception e) {
             System.out.println("Error: " + e.getMessage());
         } finally {
