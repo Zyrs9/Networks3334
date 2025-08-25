@@ -3,18 +3,19 @@ import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.Date;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class Server {
-    // Defaults (can be overridden with CLI args)
     private static final String DEFAULT_LB_HOST = "localhost";
     private static final int DEFAULT_LB_REG_PORT = 11115;
 
-    private static DatagramSocket udpSocket; // source socket for UDP streaming (server -> client)
+    private static DatagramSocket udpSocket;
 
     public static void main(String[] args) throws IOException {
-        // ---- Parse CLI args ----
-        int tcpPort = 0;       // 0 => ephemeral, allows multiple instances
-        int udpPort = 0;       // 0 => ephemeral, allows multiple instances
+        int tcpPort = 0;   // 0 => ephemeral
+        int udpPort = 0;   // 0 => ephemeral
         String lbHost = DEFAULT_LB_HOST;
         int lbRegPort = DEFAULT_LB_REG_PORT;
 
@@ -31,27 +32,26 @@ public class Server {
             }
         }
 
-        // ---- Bind sockets (TCP first so we know the actual port to register) ----
         ServerSocket serverSocket = new ServerSocket(tcpPort);
         serverSocket.setReuseAddress(true);
-        tcpPort = serverSocket.getLocalPort(); // get the real port if ephemeral
+        tcpPort = serverSocket.getLocalPort();
 
         udpSocket = new DatagramSocket(udpPort);
         udpSocket.setReuseAddress(true);
         udpPort = udpSocket.getLocalPort();
 
-        // ---- Register with LB using the real TCP port ----
         registerWithLoadBalancer(lbHost, lbRegPort, tcpPort);
-
         System.out.println("Server listening on TCP " + tcpPort + " and UDP " + udpPort
                 + " (LB " + lbHost + ":" + lbRegPort + ")");
 
-        // ---- Accept loop ----
+        // start reporter thread (every ~2s)
+        ServerReporter reporter = new ServerReporter(lbHost, lbRegPort, tcpPort);
+        new Thread(reporter, "Srv-Reporter-" + tcpPort).start();
+
         while (true) {
             try {
                 Socket clientSocket = serverSocket.accept();
-                // No noisy "Accepted ..." log; we'll log after a real hello
-                new Thread(new ClientHandler(clientSocket), "Srv-Client-" + clientSocket.getPort()).start();
+                new Thread(new ClientHandler(clientSocket, reporter), "Srv-Client-" + clientSocket.getPort()).start();
             } catch (IOException e) {
                 System.out.println("Accept error: " + e.getMessage());
             }
@@ -63,7 +63,6 @@ public class Server {
              PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
              BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
 
-            // flexible format; LB parses the last token as the port
             out.println("!join -v dynamic " + tcpPort);
             String response = in.readLine();
             if ("!ack".equals(response)) {
@@ -76,8 +75,77 @@ public class Server {
         }
     }
 
+    // ======= Reporter (keeps a live set of clients and periodically reports to LB) =======
+    static class ServerReporter implements Runnable {
+        private final String lbHost; private final int lbPort; private final int tcpPort;
+        private final Set<ClientKey> live = ConcurrentHashMap.newKeySet();
+
+        ServerReporter(String lbHost, int lbPort, int tcpPort) {
+            this.lbHost = lbHost; this.lbPort = lbPort; this.tcpPort = tcpPort;
+        }
+
+        void onConnect(Socket s) { live.add(ClientKey.fromSocket(s)); }
+        void onHello(Socket s, String name) {
+            ClientKey k = ClientKey.fromSocket(s);
+            live.remove(k);
+            live.add(new ClientKey(name, k.ip, k.port));
+        }
+        void onDisconnect(Socket s) { live.remove(ClientKey.fromSocket(s)); }
+
+        @Override public void run() {
+            try {
+                while (true) {
+                    // Build "!report <tcpPort> clients <n> <name>@<ip> ..."
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("!report ").append(tcpPort).append(" clients ").append(live.size());
+                    for (ClientKey k : live) {
+                        String name = (k.name == null || k.name.isEmpty()) ? "unknown" : k.name;
+                        sb.append(' ').append(name).append('@').append(k.ip);
+                    }
+                    try (Socket s = new Socket(lbHost, lbPort);
+                         PrintWriter out = new PrintWriter(s.getOutputStream(), true)) {
+                        out.println(sb.toString());
+                    } catch (IOException ignored) {}
+                    Thread.sleep(2000);
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        static class ClientKey {
+            final String name; final String ip; final int port; // remote port (for uniqueness)
+            ClientKey(String name, String ip, int port) { this.name = name; this.ip = ip; this.port = port; }
+
+            static ClientKey fromSocket(Socket s) {
+                String remote = String.valueOf(s.getRemoteSocketAddress()); // "/ip:port"
+                String ip; int p;
+                int slash = remote.indexOf('/');
+                int colon = remote.lastIndexOf(':');
+                if (slash >= 0 && colon > slash) {
+                    ip = remote.substring(slash + 1, colon);
+                    p = Integer.parseInt(remote.substring(colon + 1));
+                } else {
+                    ip = remote; p = -1;
+                }
+                return new ClientKey("", ip, p);
+            }
+
+            @Override public boolean equals(Object o) {
+                if (this == o) return true;
+                if (!(o instanceof ClientKey)) return false;
+                ClientKey that = (ClientKey) o;
+                return port == that.port && Objects.equals(ip, that.ip);
+            }
+            @Override public int hashCode() { return Objects.hash(ip, port); }
+        }
+    }
+
+    // ======= Client handler (quiet on pings, background streaming) =======
     private static class ClientHandler implements Runnable {
         private final Socket clientSocket;
+        private final ServerReporter reporter;
+
         private String clientName = "";
         private InetAddress clientUdpAddr = null;
         private int clientUdpPort = -1;
@@ -85,7 +153,10 @@ public class Server {
         private volatile boolean streaming = false;
         private Thread streamThread = null;
 
-        ClientHandler(Socket socket) { this.clientSocket = socket; }
+        ClientHandler(Socket socket, ServerReporter reporter) {
+            this.clientSocket = socket; this.reporter = reporter;
+            reporter.onConnect(socket);
+        }
 
         public void run() {
             try (BufferedReader in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream(), StandardCharsets.UTF_8));
@@ -101,8 +172,8 @@ public class Server {
                         case "hello":
                             if (commands.length > 1) {
                                 clientName = commands[1];
-                                System.out.println("Client identified as: " + clientName + " from " + clientSocket.getRemoteSocketAddress());
                                 out.println("Hello, " + clientName + "!");
+                                reporter.onHello(clientSocket, clientName);
                             } else {
                                 out.println("Hello received without name. Use: hello <name>");
                             }
@@ -127,10 +198,7 @@ public class Server {
                                 out.println("No UDP registration. Use: udp <port> first.");
                                 break;
                             }
-                            if (streaming) {
-                                out.println("Already streaming.");
-                                break;
-                            }
+                            if (streaming) { out.println("Already streaming."); break; }
                             streaming = true;
                             out.println("Streaming started to " + clientUdpAddr.getHostAddress() + ":" + clientUdpPort);
                             startStreamingInBackground(out);
@@ -147,7 +215,7 @@ public class Server {
                             break;
 
                         case "ping":
-                            out.println("pong"); // LB RTT checks hit this; keep quiet in logs
+                            out.println("pong"); // LB RTT check
                             break;
 
                         case "time":
@@ -181,11 +249,12 @@ public class Server {
                     }
                 }
             } catch (IOException e) {
-                System.out.println("Client handler IO error: " + e.getMessage());
+                // client dropped
             } finally {
                 try { clientSocket.close(); } catch (IOException ignore) {}
                 streaming = false;
                 if (streamThread != null) streamThread.interrupt();
+                reporter.onDisconnect(clientSocket);
             }
         }
 
@@ -196,14 +265,11 @@ public class Server {
                     while (streaming && i++ < 30) {
                         byte[] buffer = ("tick " + System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8);
                         DatagramPacket packet = new DatagramPacket(buffer, buffer.length, clientUdpAddr, clientUdpPort);
-                        // synchronize to avoid concurrent sends on a shared DatagramSocket
-                        synchronized (udpSocket) {
-                            udpSocket.send(packet);
-                        }
+                        synchronized (udpSocket) { udpSocket.send(packet); }
                         Thread.sleep(2000);
                     }
                 } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt(); // normal on cancel
+                    Thread.currentThread().interrupt();
                 } catch (IOException e) {
                     System.out.println("Streaming error: " + e.getMessage());
                 } finally {
@@ -220,32 +286,22 @@ public class Server {
             StringBuilder sb = new StringBuilder();
             File[] filesList = dir.listFiles();
             if (filesList != null) {
-                for (File file : filesList) {
-                    sb.append(file.getName()).append(" ");
-                }
+                for (File file : filesList) sb.append(file.getName()).append(" ");
             }
             return sb.toString().trim();
         }
 
-        private static String pwd() {
-            return System.getProperty("user.dir");
-        }
+        private static String pwd() { return System.getProperty("user.dir"); }
 
-        // Line-oriented Base64 transfer to keep stream text-friendly
+        // Base64 line protocol to keep it text-safe
         private void handleSendFile(String[] commands, PrintWriter out) {
             boolean verbose = commands.length > 2 && "-v".equalsIgnoreCase(commands[1]);
             String fileName = verbose ? commands[2] : (commands.length > 1 ? commands[1] : null);
 
-            if (fileName == null) {
-                out.println("Usage: sendfile [-v] <filename>");
-                return;
-            }
+            if (fileName == null) { out.println("Usage: sendfile [-v] <filename>"); return; }
 
             File file = new File(fileName);
-            if (!file.exists() || !file.isFile()) {
-                out.println("ERROR File not found");
-                return;
-            }
+            if (!file.exists() || !file.isFile()) { out.println("ERROR File not found"); return; }
 
             out.println("FILE " + file.getName() + " " + file.length());
             Base64.Encoder encoder = Base64.getEncoder();
@@ -257,14 +313,9 @@ public class Server {
                     if (n == 0) continue;
                     String b64 = encoder.encodeToString(n == buf.length ? buf : java.util.Arrays.copyOf(buf, n));
                     out.println(b64);
-                    if (verbose) {
-                        System.out.println("Sent chunk (" + n + " bytes) of " + file.getName());
-                    }
+                    if (verbose) { System.out.println("Sent chunk (" + n + " bytes) of " + file.getName()); }
                 }
-            } catch (IOException e) {
-                out.println("ERROR Sending file: " + e.getMessage());
-                return;
-            }
+            } catch (IOException e) { out.println("ERROR Sending file: " + e.getMessage()); return; }
 
             out.println("ENDFILE");
         }
@@ -275,22 +326,13 @@ public class Server {
                     int seconds = Integer.parseInt(commands[1]);
                     compute(seconds);
                     out.println("Computed for " + seconds + " seconds");
-                } catch (NumberFormatException e) {
-                    out.println("Bad duration");
-                }
-            } else {
-                out.println("Duration not specified");
-            }
+                } catch (NumberFormatException e) { out.println("Bad duration"); }
+            } else { out.println("Duration not specified"); }
         }
 
         private static void compute(int seconds) {
-            try {
-                System.out.println("Computing for " + seconds + " seconds...");
-                Thread.sleep(seconds * 1000L);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                System.out.println("Compute interrupted: " + e.getMessage());
-            }
+            try { Thread.sleep(seconds * 1000L); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
         }
     }
 }
